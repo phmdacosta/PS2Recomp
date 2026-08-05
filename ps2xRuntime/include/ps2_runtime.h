@@ -33,6 +33,13 @@
 #include "runtime/ps2_pad.h"
 #include "ps2x/iop/iop_types.h"
 
+// Top-of-RAM slice the runtime keeps for its own async callback stacks.
+// At most four are ever live (GS, MPEG, alarm, interrupt) at 0x4000 each.
+// Real PS2 hardware reserves nothing up here: the top of RAM belongs to the
+// game, which sets its own margin. Anything larger than the actual need breaks
+// titles that claim all remaining RAM at boot, which is the common pattern.
+constexpr uint32_t kAsyncCallbackStackReserve = 0x10000u;
+
 namespace ps2x::iop
 {
     class IopSubsystem;
@@ -544,7 +551,7 @@ private:
     uint32_t m_guestHeapLimit = PS2_RAM_SIZE;
     uint32_t m_guestHeapSuggestedBase = 0x00100000u;
     bool m_guestHeapConfigured = false;
-    uint32_t m_asyncCallbackStackFloor = 0x01F00000u;
+    uint32_t m_asyncCallbackStackFloor = PS2_RAM_SIZE - kAsyncCallbackStackReserve;
     uint32_t m_asyncCallbackStackTop = PS2_RAM_SIZE;
 
     std::atomic<uint32_t> m_missingFunctionPolicy{static_cast<uint32_t>(MissingFunctionPolicy::ContinueToTarget)};
