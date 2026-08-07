@@ -9,8 +9,18 @@ namespace ps2_syscalls
     {
         constexpr uint32_t kIntcVblankStart = 2u;
         constexpr uint32_t kIntcVblankEnd = 3u;
+        constexpr uint32_t kIntcTimer0 = 9u;
+        constexpr uint32_t kIntcTimer3 = 12u;
         constexpr auto kVblankPeriod = std::chrono::microseconds(16667);
         constexpr int kMaxCatchupTicks = 4;
+
+        // How often the interrupt worker settles the EE timers and delivers
+        // their compare-match / overflow interrupts. Finer than the VBlank
+        // period on purpose: a guest alarm can be much shorter than a frame,
+        // and servicing it only at 60 Hz would quantise every timer in the
+        // system to frame boundaries. Sub-tick time is not lost either way -
+        // PS2Memory keeps the nanosecond remainder.
+        constexpr auto kEeTimerPollPeriod = std::chrono::microseconds(1000);
         constexpr uint32_t kMaxIrqHandlerSteps = 4096u;
 
         std::mutex g_irq_handler_mutex;
@@ -369,6 +379,53 @@ namespace ps2_syscalls
         return tickValue;
     }
 
+    // Rolls the EE timers forward and runs the guest handlers for whichever of
+    // them just matched or overflowed.
+    //
+    // Nothing fires unless the guest itself armed the timer: PS2Memory only
+    // records a cause when MODE has CUE plus CMPE (or OVFE) set, and it sets
+    // EQUF/OVFF at the same time. That matters - the SDK's timer ISR reads
+    // those flags and returns immediately if it finds none, so delivering the
+    // cause speculatively both achieves nothing and risks running guest code
+    // before the game has finished setting itself up.
+    static void serviceEeTimers(uint8_t *rdram, PS2Runtime *runtime)
+    {
+        if (rdram == nullptr || runtime == nullptr)
+        {
+            return;
+        }
+
+        PS2Memory &memory = runtime->memory();
+        memory.advanceEeTimers();
+
+        const uint32_t causes = memory.consumePendingTimerCauses();
+        if (causes == 0u)
+        {
+            return;
+        }
+
+        for (uint32_t cause = kIntcTimer0; cause <= kIntcTimer3; ++cause)
+        {
+            if ((causes & (1u << cause)) == 0u)
+            {
+                continue;
+            }
+
+            bool reschedulePending = false;
+            uint64_t handoffBaseline = 0u;
+            {
+                PS2Runtime::GuestExecutionScope guestExecution(runtime);
+                PS2Runtime::DeferredGuestYieldScope deferYield(reschedulePending);
+                dispatchIntcHandlersForCause(rdram, runtime, cause);
+                handoffBaseline = runtime->guestExecutionHandoffEpochSnapshot();
+            }
+            if (reschedulePending && !runtime->isStopRequested())
+            {
+                runtime->waitForGuestExecutionHandoff(handoffBaseline);
+            }
+        }
+    }
+
     static void interruptWorkerMain(uint8_t *rdram, PS2Runtime *runtime)
     {
         g_currentThreadId = -1;
@@ -378,14 +435,20 @@ namespace ps2_syscalls
 
         while (runtime != nullptr && !runtime->isStopRequested())
         {
+            // Wake at whichever comes first, the next VBlank or the next timer
+            // poll, so the EE timers get serviced at their own cadence without
+            // disturbing the frame pacing below.
             {
+                const auto wakeAt = std::min(nextTick, clock::now() + kEeTimerPollPeriod);
                 std::unique_lock<std::mutex> lock(g_irq_worker_mutex);
-                if (g_irq_worker_cv.wait_until(lock, nextTick, []()
+                if (g_irq_worker_cv.wait_until(lock, wakeAt, []()
                                                { return g_irq_worker_stop.load(std::memory_order_acquire); }))
                 {
                     break;
                 }
             }
+
+            serviceEeTimers(rdram, runtime);
 
             const auto now = clock::now();
             int ticksToProcess = 0;

@@ -141,20 +141,44 @@ namespace
         } while (!csr.compare_exchange_weak(expected, desired));
     }
 
-    constexpr uint32_t kEeTimer0Count = 0x10000000u;
-    constexpr uint32_t kEeTimer0Mode = 0x10000010u;
-    constexpr uint32_t kEeTimer0Compare = 0x10000020u;
-    constexpr uint32_t kEeTimer0Hold = 0x10000030u;
-    constexpr uint32_t kEeTimerModeCue = 1u << 7;
-    constexpr uint64_t kEeTimer0TicksPerSecond = 15720ull;
+    // EE timers T0-T3. Each block is COUNT +0x00, MODE +0x10, COMP +0x20 and,
+    // on T0/T1 only, HOLD +0x30.
+    constexpr uint32_t kEeTimerBase[4] = {0x10000000u, 0x10000800u, 0x10001000u, 0x10001800u};
+
+    // INTC causes the timers raise: T0 is 9, T3 is 12.
+    constexpr uint32_t kEeTimerIntcCause[4] = {9u, 10u, 11u, 12u};
+
+    // T_MODE bits.
+    constexpr uint32_t kEeTimerModeClks = 0x3u;      // clock source selector
+    constexpr uint32_t kEeTimerModeZret = 1u << 6;   // zero-return on compare match
+    constexpr uint32_t kEeTimerModeCue = 1u << 7;    // count up enable
+    constexpr uint32_t kEeTimerModeCmpe = 1u << 8;   // raise INTC on compare match
+    constexpr uint32_t kEeTimerModeOvfe = 1u << 9;   // raise INTC on overflow
+    constexpr uint32_t kEeTimerModeEquf = 1u << 10;  // compare-match flag, write 1 to clear
+    constexpr uint32_t kEeTimerModeOvff = 1u << 11;  // overflow flag, write 1 to clear
+    constexpr uint32_t kEeTimerModeWriteOneToClear = kEeTimerModeEquf | kEeTimerModeOvff;
+
+    constexpr uint32_t kEeTimerCounterMask = 0xFFFFu;
+    constexpr uint32_t kEeTimerCounterModulus = 0x10000u;
+
+    constexpr uint64_t kEeBusClockHz = 147456000ull;
+    constexpr uint64_t kEeHBlankHz = 15734ull; // NTSC; PAL is 15625, close enough for pacing
     constexpr uint64_t kNanosecondsPerSecond = 1000000000ull;
 
-    inline bool isEeTimer0Register(uint32_t address)
+    // T_MODE.CLKS: 0 = bus clock, 1 = /16, 2 = /256, 3 = HBLANK.
+    inline uint64_t eeTimerRateHz(uint32_t mode)
     {
-        return address == kEeTimer0Count ||
-               address == kEeTimer0Mode ||
-               address == kEeTimer0Compare ||
-               address == kEeTimer0Hold;
+        switch (mode & kEeTimerModeClks)
+        {
+        case 0u:
+            return kEeBusClockHz;
+        case 1u:
+            return kEeBusClockHz / 16ull;
+        case 2u:
+            return kEeBusClockHz / 256ull;
+        default:
+            return kEeHBlankHz;
+        }
     }
 
     inline uint64_t steadyClockNs()
@@ -297,13 +321,19 @@ bool PS2Memory::initialize(size_t ramSize)
         std::lock_guard<std::mutex> lock(m_completedDmacMutex);
         m_completedDmacCauses.clear();
     }
+    {
+        std::lock_guard<std::mutex> lock(m_eeTimerMutex);
+        for (EeTimer &timer : m_eeTimers)
+        {
+            timer = EeTimer{};
+        }
+        m_pendingTimerCauses = 0u;
+    }
     m_codeRegions.clear();
     m_path3Masked = false;
     m_path3MaskedFifo.clear();
     m_vif1PendingPath2ImageQwc = 0u;
     m_vif1PendingPath2DirectHl = false;
-    m_timer0LastHostNs = 0;
-    m_timer0FractionNs = 0;
 
     try
     {
@@ -371,37 +401,224 @@ bool PS2Memory::initialize(size_t ramSize)
     }
 }
 
-void PS2Memory::updateEeTimer0Counter()
+bool PS2Memory::decodeEeTimerRegister(uint32_t address, int &timerIndex, int &registerIndex)
 {
-    const uint64_t nowNs = steadyClockNs();
-    if (m_timer0LastHostNs == 0u)
+    for (int i = 0; i < 4; ++i)
     {
-        m_timer0LastHostNs = nowNs;
+        const uint32_t offset = address - kEeTimerBase[i];
+        if (offset > 0x30u)
+        {
+            continue;
+        }
+        if ((offset & 0xFu) != 0u)
+        {
+            continue;
+        }
+        // T2 and T3 have no HOLD register.
+        if (offset == 0x30u && i >= 2)
+        {
+            continue;
+        }
+        timerIndex = i;
+        registerIndex = static_cast<int>(offset >> 4);
+        return true;
+    }
+    return false;
+}
+
+// Rolls one timer forward to nowNs and records the compare match / overflow, if
+// any, that happened inside the elapsed window. Caller holds m_eeTimerMutex.
+void PS2Memory::advanceEeTimerLocked(int timerIndex, uint64_t nowNs)
+{
+    EeTimer &timer = m_eeTimers[timerIndex];
+
+    if (timer.lastHostNs == 0u)
+    {
+        timer.lastHostNs = nowNs;
         return;
     }
 
-    const uint32_t mode = m_ioRegisters.count(kEeTimer0Mode) ? m_ioRegisters[kEeTimer0Mode] : 0u;
-    if ((mode & kEeTimerModeCue) == 0u)
+    // A disabled counter does not accumulate: reset the baseline so re-enabling
+    // it does not immediately fire everything it "missed" while stopped.
+    if ((timer.mode & kEeTimerModeCue) == 0u)
     {
-        m_timer0LastHostNs = nowNs;
-        m_timer0FractionNs = 0u;
+        timer.lastHostNs = nowNs;
+        timer.fractionNs = 0u;
         return;
     }
 
-    const uint64_t elapsedNs = nowNs - m_timer0LastHostNs;
-    m_timer0LastHostNs = nowNs;
+    const uint64_t elapsedNs = nowNs - timer.lastHostNs;
+    timer.lastHostNs = nowNs;
     if (elapsedNs == 0u)
     {
         return;
     }
 
-    const uint64_t scaled = elapsedNs * kEeTimer0TicksPerSecond + m_timer0FractionNs;
+    const uint64_t scaled = elapsedNs * eeTimerRateHz(timer.mode) + timer.fractionNs;
     const uint64_t ticks = scaled / kNanosecondsPerSecond;
-    m_timer0FractionNs = scaled % kNanosecondsPerSecond;
-    if (ticks != 0u)
+    timer.fractionNs = scaled % kNanosecondsPerSecond;
+    if (ticks == 0u)
     {
-        m_ioRegisters[kEeTimer0Count] = m_ioRegisters[kEeTimer0Count] + static_cast<uint32_t>(ticks);
+        return;
     }
+
+    const uint32_t start = timer.count & kEeTimerCounterMask;
+    const uint32_t compare = timer.compare & kEeTimerCounterMask;
+    bool equal = false;
+    bool overflow = false;
+    uint32_t next = 0u;
+
+    if ((timer.mode & kEeTimerModeZret) != 0u)
+    {
+        // Zero-return: the counter wraps at COMPARE instead of at 0xFFFF, so it
+        // never reaches overflow.
+        const uint64_t period = static_cast<uint64_t>(compare) + 1u;
+        const uint64_t raw = static_cast<uint64_t>(start) + ticks;
+        equal = (raw > compare);
+        next = static_cast<uint32_t>(raw % period);
+    }
+    else
+    {
+        const uint64_t raw = static_cast<uint64_t>(start) + ticks;
+        overflow = (raw > kEeTimerCounterMask);
+
+        if (ticks >= kEeTimerCounterModulus)
+        {
+            // Swept the whole range at least once, so COMPARE was crossed
+            // wherever it sits.
+            equal = true;
+        }
+        else if (raw > kEeTimerCounterMask)
+        {
+            const uint32_t end = static_cast<uint32_t>(raw & kEeTimerCounterMask);
+            equal = (compare > start) || (compare <= end);
+        }
+        else
+        {
+            equal = (compare > start) && (compare <= static_cast<uint32_t>(raw));
+        }
+
+        next = static_cast<uint32_t>(raw & kEeTimerCounterMask);
+    }
+
+    timer.count = next;
+
+    // EQUF/OVFF latch until the guest writes 1 to clear them; the SDK's ISR
+    // reads them to decide whether there is anything to service, which is why
+    // delivering the INTC cause without setting them achieves nothing.
+    if (equal)
+    {
+        timer.mode |= kEeTimerModeEquf;
+        if ((timer.mode & kEeTimerModeCmpe) != 0u)
+        {
+            m_pendingTimerCauses |= (1u << kEeTimerIntcCause[timerIndex]);
+        }
+    }
+    if (overflow)
+    {
+        timer.mode |= kEeTimerModeOvff;
+        if ((timer.mode & kEeTimerModeOvfe) != 0u)
+        {
+            m_pendingTimerCauses |= (1u << kEeTimerIntcCause[timerIndex]);
+        }
+    }
+}
+
+bool PS2Memory::readEeTimerRegister(uint32_t address, uint32_t &valueOut)
+{
+    int timerIndex = 0;
+    int registerIndex = 0;
+    if (!decodeEeTimerRegister(address, timerIndex, registerIndex))
+    {
+        return false;
+    }
+
+    std::lock_guard<std::mutex> lock(m_eeTimerMutex);
+    EeTimer &timer = m_eeTimers[timerIndex];
+
+    // Reading COUNT has to see the current value, not the one left behind by
+    // the last worker tick: guests poll it in tight loops.
+    if (registerIndex == 0)
+    {
+        advanceEeTimerLocked(timerIndex, steadyClockNs());
+    }
+
+    switch (registerIndex)
+    {
+    case 0:
+        valueOut = timer.count & kEeTimerCounterMask;
+        break;
+    case 1:
+        valueOut = timer.mode;
+        break;
+    case 2:
+        valueOut = timer.compare & kEeTimerCounterMask;
+        break;
+    default:
+        valueOut = timer.hold & kEeTimerCounterMask;
+        break;
+    }
+    return true;
+}
+
+bool PS2Memory::writeEeTimerRegister(uint32_t address, uint32_t value)
+{
+    int timerIndex = 0;
+    int registerIndex = 0;
+    if (!decodeEeTimerRegister(address, timerIndex, registerIndex))
+    {
+        return false;
+    }
+
+    std::lock_guard<std::mutex> lock(m_eeTimerMutex);
+    EeTimer &timer = m_eeTimers[timerIndex];
+
+    // Settle whatever the counter had accrued before the register changes
+    // underneath it, otherwise the elapsed window would be attributed to the
+    // new mode.
+    advanceEeTimerLocked(timerIndex, steadyClockNs());
+
+    switch (registerIndex)
+    {
+    case 0:
+        timer.count = value & kEeTimerCounterMask;
+        timer.fractionNs = 0u;
+        break;
+    case 1:
+    {
+        // EQUF and OVFF are write-one-to-clear; every other bit is written
+        // through.
+        const uint32_t preserved = timer.mode & kEeTimerModeWriteOneToClear & ~value;
+        timer.mode = (value & ~kEeTimerModeWriteOneToClear) | preserved;
+        timer.fractionNs = 0u;
+        break;
+    }
+    case 2:
+        timer.compare = value & kEeTimerCounterMask;
+        break;
+    default:
+        timer.hold = value & kEeTimerCounterMask;
+        break;
+    }
+    return true;
+}
+
+void PS2Memory::advanceEeTimers()
+{
+    const uint64_t nowNs = steadyClockNs();
+    std::lock_guard<std::mutex> lock(m_eeTimerMutex);
+    for (int i = 0; i < 4; ++i)
+    {
+        advanceEeTimerLocked(i, nowNs);
+    }
+}
+
+uint32_t PS2Memory::consumePendingTimerCauses()
+{
+    std::lock_guard<std::mutex> lock(m_eeTimerMutex);
+    const uint32_t causes = m_pendingTimerCauses;
+    m_pendingTimerCauses = 0u;
+    return causes;
 }
 
 bool PS2Memory::isScratchpad(uint32_t address) const
@@ -991,23 +1208,8 @@ void PS2Memory::write128(uint32_t address, __m128i value)
 
 bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
 {
-    if (isEeTimer0Register(address))
+    if (writeEeTimerRegister(address, value))
     {
-        if (address == kEeTimer0Count)
-        {
-            m_ioRegisters[address] = value;
-            m_timer0LastHostNs = steadyClockNs();
-            m_timer0FractionNs = 0u;
-            return true;
-        }
-
-        updateEeTimer0Counter();
-        m_ioRegisters[address] = value;
-        m_timer0LastHostNs = steadyClockNs();
-        if (address == kEeTimer0Mode)
-        {
-            m_timer0FractionNs = 0u;
-        }
         return true;
     }
 
@@ -2077,17 +2279,10 @@ uint32_t PS2Memory::readIORegister(uint32_t address)
     }
     if (address >= 0x10000000 && address < 0x10010000)
     {
-        if (address >= 0x10000000 && address < 0x10000100)
+        uint32_t timerValue = 0u;
+        if (readEeTimerRegister(address, timerValue))
         {
-            if (isEeTimer0Register(address))
-            {
-                if (address == kEeTimer0Count)
-                {
-                    updateEeTimer0Counter();
-                }
-                auto timerIt = m_ioRegisters.find(address);
-                return timerIt != m_ioRegisters.end() ? timerIt->second : 0u;
-            }
+            return timerValue;
         }
 
         if (address >= 0x10008000 && address < 0x1000F000)

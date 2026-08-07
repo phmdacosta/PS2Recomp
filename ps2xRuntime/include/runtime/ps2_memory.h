@@ -345,6 +345,20 @@ public:
     void processPendingTransfers();
     std::vector<uint32_t> consumeCompletedDmacCauses();
 
+    // EE timers T0-T3.
+    //
+    // advanceEeTimers() rolls every enabled counter forward against the host
+    // clock and records any compare match / overflow that fell inside the
+    // elapsed window. consumePendingTimerCauses() then hands the resulting INTC
+    // causes (9..12, as a bitmask indexed by cause) to whoever is going to
+    // dispatch the guest handlers, and clears them.
+    //
+    // Split in two on purpose: this class must not reach into the kernel
+    // syscall layer, which is where the INTC handler table lives. Same shape as
+    // queueCompletedDmacCause / consumeCompletedDmacCauses above.
+    void advanceEeTimers();
+    uint32_t consumePendingTimerCauses();
+
     int pollDmaRegisters();
 
     // Track code modifications for self-modifying code
@@ -438,10 +452,33 @@ public:
     bool isScratchpad(uint32_t address) const;
     uint8_t *mapVuMemory(uint32_t physAddr, uint32_t size, uint32_t &offset, uint32_t &limit);
     const uint8_t *mapVuMemory(uint32_t physAddr, uint32_t size, uint32_t &offset, uint32_t &limit) const;
-    void updateEeTimer0Counter();
     void queueCompletedDmacCause(uint32_t cause);
-    uint64_t m_timer0LastHostNs = 0;
-    uint64_t m_timer0FractionNs = 0;
+
+    // One EE timer. COUNT and COMPARE are 16-bit on hardware; they are kept
+    // masked to 16 bits here. lastHostNs/fractionNs carry the sub-tick
+    // remainder so a slow poll rate does not lose time.
+    struct EeTimer
+    {
+        uint32_t count = 0;
+        uint32_t mode = 0;
+        uint32_t compare = 0;
+        uint32_t hold = 0;
+        uint64_t lastHostNs = 0;
+        uint64_t fractionNs = 0;
+    };
+
+    // Timer registers deliberately do NOT live in m_ioRegisters: the counters
+    // are advanced from the interrupt worker thread while guest threads write
+    // the same registers, and concurrent operator[] on that unordered_map can
+    // rehash under another thread's iterator.
+    mutable std::mutex m_eeTimerMutex;
+    EeTimer m_eeTimers[4];
+    uint32_t m_pendingTimerCauses = 0; // bitmask indexed by INTC cause (9..12)
+
+    static bool decodeEeTimerRegister(uint32_t address, int &timerIndex, int &registerIndex);
+    bool readEeTimerRegister(uint32_t address, uint32_t &valueOut);
+    bool writeEeTimerRegister(uint32_t address, uint32_t value);
+    void advanceEeTimerLocked(int timerIndex, uint64_t nowNs);
 };
 
 #endif // PS2_MEMORY_H
