@@ -21,5 +21,6 @@ ps2xRuntime/output
 ps2xRuntime/src/runner
 android/app/.cxx/
 android/local.properties
-android/.gradle/ 
+android/.gradle/
 .idea/
+.local/
