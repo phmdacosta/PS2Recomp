@@ -703,7 +703,11 @@ namespace ps2_syscalls
         const uint32_t heapBase = (heapBaseRaw + 0xFu) & ~0xFu;
 
         // Silent Hill and other games often pass -1 (0xFFFFFFFF) to mean "rest of RAM".
-        static constexpr uint32_t kDefaultGuestHeapEnd = 0x01F00000u;
+        // "Rest of RAM" must reach the real top minus the runtime's own reservation
+        // for async callback stacks (see m_asyncCallbackStackFloor). Real hardware
+        // reserves nothing here, so capping lower breaks games that claim all the
+        // remaining RAM at boot.
+        static constexpr uint32_t kDefaultGuestHeapEnd = PS2_RAM_SIZE - kAsyncCallbackStackReserve;
         uint32_t heapLimit = kDefaultGuestHeapEnd;
 
         if (heapSize != 0u && heapSize != 0xFFFFFFFFu)
@@ -743,7 +747,7 @@ namespace ps2_syscalls
     {
         (void)rdram;
 
-        static constexpr uint32_t kDefaultGuestHeapEnd = 0x01F00000u;
+        static constexpr uint32_t kDefaultGuestHeapEnd = PS2_RAM_SIZE - kAsyncCallbackStackReserve;
 
         const uint32_t ret = runtime
                                  ? runtime->guestHeapLimit()
