@@ -226,6 +226,32 @@ int main(int argc, char *argv[])
             return 1;
         }
 
+        // Raw sceCdRead requests need a disc image. loadELF() resets the IO
+        // paths, so configure this after loading the executable.
+        std::filesystem::path cdImage;
+        if (argc >= 3 && argv[2] != nullptr && argv[2][0] != '\0')
+        {
+            cdImage = argv[2];
+        }
+        else if (const char *fromEnvironment = std::getenv("PS2X_CD_IMAGE");
+                 fromEnvironment != nullptr && fromEnvironment[0] != '\0')
+        {
+            cdImage = fromEnvironment;
+        }
+
+        if (!cdImage.empty())
+        {
+            std::error_code ec;
+            if (!std::filesystem::exists(cdImage, ec))
+            {
+                std::cerr << "CD image not found: " << cdImage << std::endl;
+                return 1;
+            }
+            PS2Runtime::IoPaths paths = PS2Runtime::getIoPaths();
+            paths.cdImage = cdImage;
+            PS2Runtime::setIoPaths(paths);
+        }
+
         runtime.run();
 
 #ifdef _DEBUG

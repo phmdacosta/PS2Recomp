@@ -7,6 +7,7 @@ namespace ps2_stubs
 {
     namespace
     {
+        constexpr uint32_t kSceCdFuncRead = 1u;
         constexpr uint32_t kCdStreamBlocking = 1u;
         constexpr uint32_t kDvdSectorsPerSecondX1 = 675u;
         constexpr uint32_t kDvdSectorsPerSecondX4 = kDvdSectorsPerSecondX1 * 4u;
@@ -30,6 +31,38 @@ namespace ps2_stubs
 
         uint32_t g_cdStReadTraceCount = 0u;
         CdStreamTimingState g_cdStreamTiming;
+        std::mutex g_cdCallbackMutex;
+        uint32_t g_cdCallbackFunc = 0u;
+        uint32_t g_cdCallbackGp = 0u;
+
+        void queueCdCompletionCallback(PS2Runtime *runtime, uint32_t reason)
+        {
+            if (runtime == nullptr)
+            {
+                return;
+            }
+
+            uint32_t handler = 0u;
+            uint32_t gp = 0u;
+            {
+                std::lock_guard<std::mutex> lock(g_cdCallbackMutex);
+                handler = g_cdCallbackFunc;
+                gp = g_cdCallbackGp;
+            }
+            if (handler == 0u)
+            {
+                return;
+            }
+
+            GuestInvocation invocation{};
+            invocation.kind = GuestInvocationKind::RpcCallback;
+            invocation.context.pc = handler;
+            SET_GPR_U32(&invocation.context, 4, reason);
+            SET_GPR_U32(&invocation.context, 28, gp);
+            SET_GPR_U32(&invocation.context, 29, 0u);
+            SET_GPR_U32(&invocation.context, 31, 0u);
+            runtime->eeScheduler().queueInvocation(std::move(invocation));
+        }
 
         uint64_t currentCdStreamTick(PS2Runtime *runtime)
         {
@@ -316,6 +349,7 @@ namespace ps2_stubs
         if (ok)
         {
             g_cdStreamingLbn = selected.lbn + selected.sectors;
+            queueCdCompletionCallback(runtime, kSceCdFuncRead);
             setReturnS32(ctx, 1); // command accepted/success
             return;
         }
@@ -355,7 +389,16 @@ namespace ps2_stubs
 
     void sceCdCallback(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
-        setReturnS32(ctx, 0);
+        const uint32_t handler = getRegU32(ctx, 4);
+        const uint32_t gp = getRegU32(ctx, 28);
+        uint32_t previous = 0u;
+        {
+            std::lock_guard<std::mutex> lock(g_cdCallbackMutex);
+            previous = g_cdCallbackFunc;
+            g_cdCallbackFunc = handler;
+            g_cdCallbackGp = gp;
+        }
+        setReturnS32(ctx, static_cast<int32_t>(previous));
     }
 
     void sceCdChangeThreadPriority(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
